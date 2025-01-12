@@ -46,9 +46,8 @@ tensor_uop_spec = PatternMatcher([
   (UPat(Ops.COPY, name="copy", src=(UPat(Ops.DEVICE), UPat.var("x"))), lambda copy,x: isinstance(copy.arg, bool) and copy.dtype == x.dtype),
 
   # VIEW(BUFFER) applies a ShapeTracker on top of the underlying device buffer
-  # NOTE: VIEW size exactly matches the underlying BUFFER, tensor doesn't apply movement ops to the VIEW
-  (UPat(Ops.VIEW, name="view", src=(UPat(Ops.BUFFER, name="buf"),)),
-   lambda view,buf: view.dtype == buf.dtype and view.size == buf.size and view.st.contiguous),
+  # NOTE: this VIEW can apply movement ops on the buffer
+  (UPat(Ops.VIEW, name="view", src=(UPat(Ops.BUFFER, name="buf"),)), lambda view,buf: view.dtype == buf.dtype),
 
   # ASSIGN changes the value of a realized buffer
   (UPat(Ops.ASSIGN, name="assign", src=(UPat.var("target"), UPat.var("new_val"))),
@@ -122,7 +121,7 @@ def add_buffers(buf:UOp, ctx:ScheduleContext, tensor_map:dict[UOp, UOp], cache:d
   op = buf.replace(dtype=dtype.base, src=tuple(add_buffers(x, ctx, tensor_map, cache) for x in buf.src))
   # track the underlying tensor uop for this op
   # TODO: is this slow? do we need reverse_tensor_map?
-  ctx.tensor_uops[buf_uop] = [k for k,v in tensor_map.items() if v is buf]
+  ctx.tensor_uops[buf_uop] = [k for k,v in tensor_map.items() if v.base is buf]
   # (early) bufferize
   cache[buf] = ret = UOp(Ops.VIEW, dtype.base, (buf_uop, op), buf.st)
   return ret
@@ -421,6 +420,9 @@ ops_folding = symbolic_simple+PatternMatcher([
    lambda reduce,x: reduce.const_like(identity_element(reduce.arg[0], reduce.dtype)) if x.size == 0 and reduce.size != 0 else None),
   # reduce of const is collapsed (TODO: make this a generic rule for stride0)
   (UPat(Ops.REDUCE_AXIS, name="reduce", src=(UPat.cvar("x"),)), simplify_reduceop),
+  # CAST before VIEW
+  (UPat(Ops.CAST, name="root", src=(UPat(Ops.VIEW, name="view", src=(UPat.var("x"),)),)),
+   lambda root,view,x: x.cast(root.dtype).view(view.st) if root.dtype.itemsize <= x.dtype.itemsize else None),
   # CONST doesn't need COPY
   (UPat(Ops.COPY, src=(UPat(), UPat.cvar("x"),)), lambda x: x),
   # no COPY to same device, except clone (arg is True)
@@ -544,7 +546,7 @@ def create_schedule_with_vars(outs:list[UOp], skip_check:bool=not __debug__) -> 
     prescheduled.append(schedule_uop(UOp.sink(*to_store), store_uops, ctx))
     # can only schedule once
     for buf_uop in store_uops:
-      for luop in ctx.tensor_uops[buf_uop]: ctx.becomes_map[luop] = buf_uop.view(unwrap(luop.st))
+      for luop in ctx.tensor_uops[buf_uop]: ctx.becomes_map[luop] = buf_uop.view(tensor_map[luop].st)
   # do BFS
   schedule_targets = {out:si for si in prescheduled for out in si.outputs}
   graph: defaultdict[ScheduleItem, list[ScheduleItem]] = defaultdict(list)
