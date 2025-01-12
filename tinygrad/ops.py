@@ -235,7 +235,6 @@ class UOpMetaClass(type):
 # some uops map to other stuff
 buffers:weakref.WeakKeyDictionary[UOp, Buffer] = weakref.WeakKeyDictionary() # this maps BUFFER uops to their device Buffers
 all_metadata:weakref.WeakKeyDictionary[UOp, Metadata] = weakref.WeakKeyDictionary()
-forced_realize:weakref.WeakSet[UOp] = weakref.WeakSet()
 
 # NOTE: this should be frozen, but frozen is slower
 @dataclass(eq=False, slots=True)
@@ -289,6 +288,8 @@ class UOp(MathTrait, metaclass=UOpMetaClass):
     if self.op in GroupOp.Movement: return unwrap(self.src[0].st).mop(self.op, self.arg)
     # buffer ops return the ShapeTracker from sources
     if self.op in GroupOp.Buffer: return vsrc[0] if len(vsrc:=[x.st for x in self.src if x.op is Ops.VIEW]) != 0 else None
+    from tinygrad.shape.shapetracker import ShapeTracker
+    if self.op is Ops.BUFFER: return ShapeTracker.from_shape((self.size,))
     if not (src_sts := [x.st for x in self.src if x.st is not None]): return None
     assert all_same([x.shape for x in src_sts]), f"UOp sources must have the same shape {self} {[x.shape for x in src_sts]}"
     if self.op is Ops.BUFFER_VIEW:
@@ -361,17 +362,6 @@ class UOp(MathTrait, metaclass=UOpMetaClass):
   def cast(self, dtype:DType, bitcast=False):
     if bitcast: return self.bitcast(dtype)
     if self._device is not None and self._device.startswith("DISK"): raise RuntimeError("CAST isn't supported on DISK")
-    if getenv("CAST_BEFORE_VIEW", 1) and dtype.itemsize <= self.dtype.itemsize and self is not self.base:
-      # NOTE: we have to apply the movementops here, we can't use VIEW (yet)
-      # TODO: move this to the scheduler
-      ret = self.base.cast(dtype, bitcast)
-      op_arg = []
-      mop = self
-      while mop is not self.base:
-        op_arg.append((mop.op, mop.arg))
-        mop = mop.src[0]
-      for op,arg in reversed(op_arg): ret = UOp(op, ret.dtype, (ret,), arg)
-      return ret
     return UOp(Ops.CAST, dtype, (self,))
   def bitcast(self, dtype:DType):
     if self.st is not None and self.shape and ((self.shape[-1]*self.dtype.itemsize)%dtype.itemsize != 0):
@@ -434,8 +424,7 @@ class UOp(MathTrait, metaclass=UOpMetaClass):
   def contiguous(self, allow_buffer_view=True):
     if not unwrap(self.st).contiguous or self.size != self.base.size or self.base.op is Ops.CONST:
       return self.alu(Ops.BUFFER_VIEW if allow_buffer_view and self.can_view() else Ops.CONTIGUOUS)
-    forced_realize.add(self.base)
-    return self
+    return UOp(Ops.CONTIGUOUS, self.dtype, (self,))
 
   # *** from LazyBuffer ***
 
@@ -469,21 +458,14 @@ class UOp(MathTrait, metaclass=UOpMetaClass):
   def lbs(self): return [self]
   @property
   def metadata(self): return all_metadata.get(self, None)
-  @property
-  def forced_realize(self): return self in forced_realize
 
   # *** uop movement ops ***
 
   @property
   def base(self) -> UOp:
     if self.op in GroupOp.Movement: return self.src[0].base
-    return self.src[0] if self.op is Ops.VIEW and len(self.src) == 1 and self.src[0].op is not Ops.BUFFER else self
-  def view(self, new_st:ShapeTracker) -> UOp:
-    if self.st is None: return UOp(Ops.VIEW, self.dtype.base if not isinstance(self.dtype, ImageDType) else self.dtype, (self,), new_st)
-    ret = UOp(Ops.VIEW, self.dtype, (self.base,), new_st)
-    # instant folding rules
-    if new_st.contiguous and self.base.shape == new_st.shape: return self.base
-    return ret
+    return self.src[0] if self.op is Ops.VIEW and len(self.src) == 1 else self
+  def view(self, new_st:ShapeTracker) -> UOp: return UOp(Ops.VIEW, self.dtype, (self.base,), new_st)
 
   def _mop(self, op:Ops, arg):
     ret = UOp(op, self.dtype, (self,), arg)
@@ -510,7 +492,9 @@ class UOp(MathTrait, metaclass=UOpMetaClass):
     return dsrcs[0]._device if len(dsrcs:=[x for x in self.src if x._device is not None]) != 0 else None
   @property
   def buf_uop(self) -> UOp:
-    if self.op is Ops.BUFFER: return self
+    # NOTE: if it's a VIEW(BUFFER) we return the base buffer
+    if self.base.op is Ops.BUFFER: return self.base
+    # otherwise it exists in the sources
     assert self.base.op in {*GroupOp.Buffer, Ops.ASSIGN, Ops.VIEW}, f"buf_uop called on {self.op}"
     return self.src[0].buf_uop
   def buf_uop_view(self) -> UOp: return self.buf_uop.view(unwrap(self.st))
@@ -898,6 +882,13 @@ def graph_rewrite(sink:UOp, pm:PatternMatcher, ctx=None, bottom_up=False) -> UOp
   if TRACK_MATCH_STATS >= 2 and not bottom_up and len(tracked_ctxs) != 0: # TODO: make viz work with bottom_up=True
     tracked_ctxs[-1].append(TrackedGraphRewrite(((frm:=sys._getframe(1)).f_code.co_filename, frm.f_lineno), sink))
   return RewriteContext(pm, ctx).bottom_up_rewrite(sink) if bottom_up else RewriteContext(pm, ctx).rewrite(sink)
+
+def graph_rewrite_map(sink:UOp, pm:PatternMatcher, ctx=None) -> dict[UOp, UOp]:
+  if TRACK_MATCH_STATS >= 2 and len(tracked_ctxs) != 0:
+    frm = sys._getframe(1)
+    tracked_ctxs[-1].append(TrackedGraphRewrite((frm.f_code.co_filename, frm.f_lineno), sink))
+  rewrite_ctx = RewriteContext(pm, ctx)
+  return {k:rewrite_ctx.rewrite(k) for k in list(sink.toposort)[::-1]}
 
 # ***** uop type spec *****
 

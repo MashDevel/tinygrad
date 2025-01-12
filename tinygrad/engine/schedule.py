@@ -123,7 +123,7 @@ def add_buffers(buf:UOp, ctx:ScheduleContext, cache:dict[UOp, UOp]) -> UOp:
   # track the underlying tensor uop for this op
   ctx.tensor_uops[buf_uop] = [buf]
   # (early) bufferize
-  cache[buf] = ret = UOp(Ops.VIEW, dtype.base, (buf_uop, op.alu(Ops.CONTIGUOUS) if buf.forced_realize else op), buf.st)
+  cache[buf] = ret = UOp(Ops.VIEW, dtype.base, (buf_uop, op), buf.st)
   return ret
 
 # **** AST graph rewrite
