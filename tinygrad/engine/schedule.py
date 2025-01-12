@@ -241,7 +241,7 @@ remove_buffers = PatternMatcher([
 ])
 
 def schedule_uop(sink:UOp, store_targets:tuple[UOp, ...], ctx:ScheduleContext) -> ScheduleItem:
-  assert all(x.op is Ops.BUFFER for x in store_targets), f"store targets must be BUFFER {store_targets}" 
+  assert all(x.op is Ops.BUFFER for x in store_targets), f"store targets must be BUFFER {store_targets}"
   # start by replacing BUFFER in the graph with LOAD and add STOREs
   pre = graph_rewrite(sink, remove_buffers, bufs:=list(store_targets))
   # create the ast context
