@@ -30,9 +30,9 @@ class ProcessReplayWarning(Warning): pass
 
 # *** recreators
 
-def recreate_sched(ast:UOp, assigns:Set[UOp]) -> UOp:
+def recreate_sched(ast:UOp) -> UOp:
   # NOTE: process replay isn't meant to actually schedule anything
-  return schedule_uop(ast, ScheduleContext(assigns=assigns, tensor_uops=defaultdict(list))).ast
+  return schedule_uop(ast, ScheduleContext()).ast
 def recreate_kernel(ast:UOp, opts:Renderer, applied_opts:List[Opt], name:str) -> str:
   k = Kernel(ast, opts=opts)
   for opt in applied_opts: k.apply_opt(opt)

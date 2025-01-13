@@ -3,7 +3,7 @@ from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from tinygrad.ops import GroupOp, UOp, Ops, PatternMatcher, UPat, Variable, can_pad, graph_rewrite, resolve, track_rewrites, view_left, merge_views
 from tinygrad.ops import identity_element, buffers, symbolic_simple, type_verify
-from tinygrad.helpers import Context, Metadata, all_int, all_same, colored, diskcache_put, merge_dicts, prod, dedup, getenv, unwrap
+from tinygrad.helpers import Context, Metadata, all_int, all_same, diskcache_put, merge_dicts, prod, dedup, getenv, unwrap
 from tinygrad.helpers import FUSE_CONV_BW, FUSE_ARANGE, DEBUG, CAPTURE_PROCESS_REPLAY, ContextVar
 from tinygrad.dtype import DType, ImageDType, dtypes
 from tinygrad.shape.shapetracker import ShapeTracker
@@ -185,12 +185,9 @@ view_right = merge_views+PatternMatcher([
 
 @dataclass(frozen=True)
 class ScheduleItemContext:
-  assigns: set[UOp]
   var_vals: dict[Variable, int]
-  sinked: dict[UOp, UOp]
   sts: set[ShapeTracker] = field(default_factory=set)
   bufs: list[UOp] = field(default_factory=list)
-  assign_adj: dict[UOp, list[UOp]] = field(default_factory=dict)
 
 def _append_st_vars(ctx:ScheduleItemContext, x:UOp) -> UOp|None:
   if (st:=unwrap(x.st)) in ctx.sts: return None
@@ -204,48 +201,33 @@ def _append_buf(ctx:ScheduleItemContext, x:UOp) -> UOp:
   return UOp(Ops.DEFINE_GLOBAL, x.dtype.ptr(size=x.size), (), len(ctx.bufs)-1)
 append_bufs = PatternMatcher([(UPat(Ops.BUFFER, name="x"), _append_buf)])
 
-def _append_preload(ctx:ScheduleItemContext, x:UOp, b:UOp) -> UOp:
-  (adj_loads:=ctx.assign_adj.setdefault(b, [])).append(x)
-  if not all_same([x.op for x in adj_loads]): raise RuntimeError(f"Detected cycle when fusing {adj_loads}. Can only fuse PRELOAD or LOAD of {b}")
-  return x.replace(op=Ops.LOAD)
-check_preload = PatternMatcher([(UPat(Ops.PRELOAD, src=(UPat.var("b"), UPat()), name="x"), _append_preload),])
-
 to_si = PatternMatcher([
   (UPat(Ops.VIEW, name="x"), _append_st_vars),
   (UPat(Ops.SINK, src=(UPat.store(UPat.var("b"), UPat(), UPat(GroupOp.Meta, name="x")),)), lambda b,x: x.replace(src=(b, *x.src))),
   # don't need contiguous or assign anymore
   (UPat(Ops.CONTIGUOUS, src=(UPat.var("x"),)), lambda x: x),
   (UPat(Ops.ASSIGN, src=(UPat(), UPat.var("x"),)), lambda x: x),
+  # PRELOAD becomes LOAD
+  (UPat(Ops.PRELOAD, name="root"), lambda root:root.replace(op=Ops.LOAD)),
 ])
 
-add_assign_adjacents = PatternMatcher([(UPat.load(UPat.var("b"), UPat(), name="x"), lambda ctx,b,x: ctx.assign_adj.setdefault(b, []).append(x)
-                               if b in ctx.assigns else None)])
-
-# late folding for multi output kernels
-multioutput = PatternMatcher([(UPat.load(UPat.var("b"), UPat()), lambda ctx,b: ctx.sinked.get(b)),])
+# LOAD(BUFFER) -> the STORE value if it's a multi output kernel
+multioutput = PatternMatcher([(UPat.load(UPat.var("b"), UPat()), lambda ctx,b: ctx.get(b)),])
 
 def schedule_uop(pre:UOp, ctx:ScheduleContext) -> ScheduleItem:
-  # create the ast context
-  si_ctx = ScheduleItemContext(ctx.assigns, ctx.var_vals, {x.buf_uop:x.src[2] for x in pre.src})
-  # do movement ops
-  sink = graph_rewrite(graph_rewrite(pre, multioutput+add_assign_adjacents+view_left, si_ctx), view_right)
-  # convert to AST
-  sink = graph_rewrite(graph_rewrite(sink, to_si+check_preload if len(si_ctx.assigns) != 0 else to_si, si_ctx), append_bufs, si_ctx)
-  # assert buffer count limit
-  if (limit:=BUF_LIMIT.get(device:=si_ctx.bufs[0].device)) is not None and len(si_ctx.bufs) >= limit:
-    raise RuntimeError(f"Kernel exceeded the {limit} buffer count limit for {device} with {len(si_ctx.bufs)} buffers.")
-  # we also allow masked views. if it has a single view and it's equal when you shrink a contig, it's fine
-  for ubuf,ops in si_ctx.assign_adj.items():
-    if si_ctx.sinked.get(ubuf) is not None and not all((s:=x.st_arg).contiguous or (len(s.views) == 1 and (m:=s.views[0].mask) is not None \
-        and ShapeTracker.from_shape(s.shape).shrink(m) == s.shrink(m)) for x in ops):
-      raise RuntimeError("self operand of augmented assign must be contiguous.\nhelp: consider using .contiguous():\n"
-                         +colored("   - a += a.T\n", "red")+colored("   + a += a.T.contiguous()", "green"))
+  # remove VIEW in the middle of the ast
+  base_pm = view_left
+  # substitute LOAD of grouped BUFFER with just the store value
+  if len(pre.src) > 1: base_pm = multioutput+base_pm
+  sink = graph_rewrite(graph_rewrite(pre, base_pm, {x.src[0]:x.src[2] for x in pre.src}), view_right)
+  # replace BUFFER with DEFINE_GLOBAL and remove ops we don't need
+  sink = graph_rewrite(sink, to_si+append_bufs, si_ctx:=ScheduleItemContext(ctx.var_vals))
   # capture process replay
   if CAPTURE_PROCESS_REPLAY:
-    with Context(PICKLE_BUFFERS=0): PROCESS_REPLAY_CAPTURE[str(pre.key)] = pickle.dumps((pre, si_ctx.assigns, ContextVar._cache, sink))
+    with Context(PICKLE_BUFFERS=0): PROCESS_REPLAY_CAPTURE[str(pre.key)] = pickle.dumps((pre, ContextVar._cache, sink))
   return ScheduleItem(sink, tuple(u.buffer for u in si_ctx.bufs if u.size != 0),
-                      tuple({m for x in pre.toposort if (m:=ctx.ops_metadata.get(x)) is not None}),
-                      tuple(ubuf for ubuf,ops in si_ctx.assign_adj.items() if any(x.op is Ops.PRELOAD for x in ops)))
+                      tuple(dedup(m for x in pre.toposort if (m:=ctx.ops_metadata.get(x)) is not None)),
+                      tuple(dedup(b.buf_uop for b in pre.toposort if b.op is Ops.PRELOAD)))
 
 PROCESS_REPLAY_CAPTURE: dict[str, bytes] = {}
 if CAPTURE_PROCESS_REPLAY:
