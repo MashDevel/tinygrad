@@ -168,6 +168,8 @@ def merge_double_reduce(root:UOp, first_reduce:UOp) -> UOp:
 
 # push VIEW to stores
 view_right = merge_views+PatternMatcher([
+  # VIEW(CONST) -> VALID
+  (UPat(Ops.VIEW, name="st", src=(UPat(Ops.CONST, name="x"))), lambda x,st: UOp.const(x.dtype.base, x.const_arg).valid(st.st)),
   # STORE(.., ASSIGN(VIEW(BUFFER), new_val)) -> STORE(.., new_val).view()
   (UPat(Ops.STORE, src=(UPat.var("b"), UPat.var("st"), UPat.assign(UPat.var("target"), UPat.var("val")))),
    lambda b,target,st,val: apply_swizzle(UOp.store(b, st, val).view(target.st))),
@@ -218,6 +220,8 @@ to_si = PatternMatcher([
   # don't need contiguous or assign anymore
   (UPat(Ops.CONTIGUOUS, src=(UPat.var("x"),)), lambda x: x),
   (UPat(Ops.ASSIGN, src=(UPat(), UPat.var("x"),)), lambda x: x),
+  # don't need VIEW on CONST anymore
+  (UPat(Ops.CONST, name="x", src=(UPat(),)), lambda x:x.replace(src=())),
 ])
 
 add_metadata = PatternMatcher([(UPat(tuple(Ops), name="x"), lambda ctx,x: None if (m:=ctx.ops_metadata.get(x)) is None else ctx.metadata.add(m)),])
@@ -498,8 +502,6 @@ def store_or_fuse(ctx:ScheduleContext, b:UOp, x:UOp, st:UOp):
   return UOp(Ops.LOAD, x.dtype, (b, unwrap(st.st).to_uop()))
 
 break_sched = PatternMatcher([
-  # CONST is always fused and generated
-  (UPat(Ops.CONST, name="x", src=(UPat(Ops.VIEW, name="st"),)), lambda x,st: UOp.const(x.dtype.base, x.const_arg).valid(st.st)),
   (UPat(Ops.BIND, name="bind", src=(UPat.var("var"), UPat.var("val"))), unbind_variable),
   # VIEW of BUFFER either becomes a LOAD/STORE or we fuse it
   (UPat(Ops.VIEW, name="st", src=(UPat(Ops.BUFFER, name="b"),)), load_realized),
