@@ -14,7 +14,7 @@ from tinygrad.dtype import DType, ImageDType
 from tinygrad.shape.shapetracker import ShapeTracker
 from tinygrad.shape.view import View
 from tinygrad.ops import PatternMatcher, UOp, Ops, UPat, graph_rewrite, track_rewrites, view_supported_devices, symbolic_simple, merge_views
-from tinygrad.helpers import CI, DEBUG, FUSE_ARANGE, GlobalCounters, getenv, SPLIT_REDUCEOP, unwrap, prod, Context
+from tinygrad.helpers import CI, DEBUG, FUSE_ARANGE, SPLIT_REDUCEOP, GlobalCounters, getenv, unwrap, prod, all_same, Context
 from tinygrad.codegen.kernel import verify_ast
 from tinygrad.engine.schedule import BUF_LIMIT, ScheduleItem, create_schedule_with_vars, view_right, view_left, remove_movement_ops
 from tinygrad.engine.realize import CompiledRunner, run_schedule, lower_schedule
@@ -217,16 +217,6 @@ class TestSchedule(unittest.TestCase):
     first = a.assign(b)
     second = a.assign(b)
     check_schedule([first, second], 1)
-
-  # NOTE: this is causing "LAZYCACHE=1 incorrectly reuses contiguous const" #4562
-  # should contiguous dedup?
-  def test_dedup_contiguous(self):
-    a = Tensor.ones(4).contiguous()
-    b = Tensor.ones(4).contiguous()
-    sched = check_schedule([a, b], 1)
-    run_schedule(sched)
-    # a and b share the same underlying device memory
-    self.assertIs(a.lazydata.realized, b.lazydata.realized)
 
   def test_copy_dedups(self):
     src = Tensor.ones(4).contiguous().realize()
@@ -504,20 +494,106 @@ class TestSchedule(unittest.TestCase):
     Tensor.training = old_training
 
   def test_contiguous_while_contiguous(self):
+    # this is already a BUFFER
     x = Tensor.empty(1, 64, 32, 32)
+    self.assertIsNotNone(x.lazydata.base.realized)
     out = x.contiguous()
-    check_schedule(out, 0, filter_sink=False)
+    run_schedule(check_schedule(out, 0, filter_sink=False))
+    # out and x share the same BUFFER
+    self.assertIs(out.lazydata.buffer, x.lazydata.buffer)
 
   def test_contiguous_while_not_contiguous(self):
     x = Tensor.empty(1, 64, 32, 32)
+    self.assertIsNotNone(x.lazydata.base.realized)
     out = x.permute(0,2,3,1).contiguous()
     check_schedule(out, 1, filter_sink=False)
+    # x and out have different BUFFERs
+    self.assertIsNotNone(out.lazydata.base.realized)
+    self.assertIsNot(out.lazydata.buffer, x.lazydata.buffer)
+
+  def test_tiny_fold_with_contiguous(self):
+    add = Tensor.empty(4, 4)+Tensor.empty(4, 4)
+    add_contiguous = add.contiguous()
+    run_schedule(check_schedule(add_contiguous, 1))
+    self.assertIs(add.lazydata, add_contiguous.lazydata)
+    # a_contig and a share a Buffer
+    self.assertIs(add.lazydata.base.buffer, add_contiguous.lazydata.base.buffer)
 
   def test_fold_with_contiguous(self):
     a = Tensor.randn(16, 16, 16).realize()
     b = Tensor.randn(16, 16).realize()
-    c = (a.sum(2).contiguous() + b).contiguous()
-    check_schedule(c, 2)
+    c = (a.sum(2).contiguous() + b)
+    c_contiguous = c.contiguous()
+    run_schedule(check_schedule(c_contiguous, 2))
+    # NOTE: see c and c_contiguous share a BUFFER and have equivilant lazydata
+    self.assertIs(c.lazydata, c_contiguous.lazydata)
+    self.assertIs(c.lazydata.base.realized, c_contiguous.lazydata.base.realized)
+
+  def test_view_after_contiguous(self):
+    a = Tensor.empty(1, 2, 3)+Tensor.empty(1, 2, 3)
+    a_view = a.reshape(2, 3, 1)
+    out = a_view.contiguous()
+    run_schedule(check_schedule(out, 1))
+    # we don't realize the reshape!
+    self.assertEqual(out.lazydata.base.shape, (1, 2, 3))
+    # a contiguous view doesn't need to realize, even if contiguous is called.
+    self.assertEqual(out.lazydata.shape, (2, 3, 1))
+
+  def test_view_after_contiguous_children(self):
+    a = Tensor.arange(16)
+    a_view1 = a.reshape(2, 8).contiguous()
+    a_view2 = a.reshape(8, 2).contiguous()
+    run_schedule(check_schedule([a_view1, a_view2], 1))
+    # all view children have the same base buffer
+    assert all_same([x.lazydata.base for x in [a, a_view1, a_view2]])
+    self.assertEqual(a.lazydata.base.realized.size, 16)
+    # each child applies its own view on the (same) buffer
+    self.assertEqual(a.lazydata.shape, (16,))
+    self.assertEqual(a_view1.lazydata.shape, (2, 8))
+    self.assertEqual(a_view2.lazydata.shape, (8, 2))
+
+  def test_view_after_non_contiguous_children(self):
+    av = Tensor.arange(16).reshape(4, 4, 1)
+    a_view1 = av.expand(4, 4, 4).contiguous()
+    a_view2 = av.expand(4, 4, 2).contiguous()
+    run_schedule(check_schedule([a_view1, a_view2], 3))
+    # the view children get unique buffers
+    self.assertEqual(av.lazydata.base.buffer.size, 4*4)
+    self.assertEqual(a_view1.lazydata.buffer.size, 4*4*4)
+    self.assertEqual(a_view2.lazydata.buffer.size, 4*4*2)
+
+  def test_contiguous_const_stays(self):
+    a = Tensor(1)
+    assert UPat(Ops.CONST).match(a.lazydata, {})
+    b = a.contiguous()
+    assert UPat(Ops.CONTIGUOUS, src=(UPat(Ops.CONST))).match(b.lazydata, {})
+    run_schedule(check_schedule(b, 1))
+    # const itself never realizes
+    self.assertIsNone(a.lazydata.base.realized)
+    # but the contiguous on top of it does
+    self.assertTrue(a.lazydata.st.contiguous)
+    self.assertEqual(b.lazydata.buffer.size, 1)
+
+  # NOTE: this is causing "LAZYCACHE=1 incorrectly reuses contiguous const" #4562
+  # should contiguous dedup? (in the same tensor graph (universe?))
+  def test_dedup_contiguous_same_schedule(self):
+    a = Tensor.ones(4).contiguous()
+    b = Tensor.ones(4).contiguous()
+    sched = check_schedule([a, b], 1)
+    run_schedule(sched)
+    # a and b share the same underlying device memory
+    self.assertIs(a.lazydata.realized, b.lazydata.realized)
+
+  def test_contiguous_after_realize_does_not_dedup(self):
+    a = Tensor.ones(4).contiguous()
+    run_schedule(check_schedule(a, 1))
+    self.assertIsNotNone(a.lazydata.base.realized)
+    # the first UOp instance for CONTIGUOUS(CONST) gets removed from the UOp cache
+    b = Tensor.ones(4).contiguous()
+    run_schedule(check_schedule(b, 1))
+    self.assertIsNotNone(b.lazydata.base.realized)
+    # a and b have a different buffer
+    self.assertIsNot(a.lazydata.realized, b.lazydata.realized)
 
   @unittest.skip("no longer supported")
   def test_double_from(self):
