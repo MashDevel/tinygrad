@@ -420,6 +420,11 @@ ops_folding = symbolic_simple+PatternMatcher([
    lambda reduce,x: reduce.const_like(identity_element(reduce.arg[0], reduce.dtype)) if x.size == 0 and reduce.size != 0 else None),
   # reduce of const is collapsed (TODO: make this a generic rule for stride0)
   (UPat(Ops.REDUCE_AXIS, name="reduce", src=(UPat.cvar("x"),)), simplify_reduceop),
+  # BUFFER is already CONTIGUOUS
+  (UPat(Ops.CONTIGUOUS, src=(UPat(Ops.BUFFER, name="x"),)), lambda x:x),
+  # apply contiguous view after CONTIGUOUS: CONTIGUOUS(VIEW(x)) -> VIEW(CONTIGUOUS(x))
+  (UPat(Ops.CONTIGUOUS, src=(UPat(Ops.VIEW, name="view", src=(UPat.var("x"),)))),
+   lambda view,x:x.contiguous().view(view.st) if view.st.contiguous and x.op is not Ops.CONST else None),
   # CAST before VIEW
   (UPat(Ops.CAST, name="root", src=(UPat(Ops.VIEW, name="view", src=(UPat.var("x"),)),)),
    lambda root,view,x: x.cast(root.dtype).view(view.st) if root.dtype.itemsize <= x.dtype.itemsize else None),
