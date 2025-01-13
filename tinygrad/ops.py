@@ -462,8 +462,13 @@ class UOp(MathTrait, metaclass=UOpMetaClass):
 
   @property
   def base(self) -> UOp:
+    # movement ops are allowed to recursively search for base
     if self.op in GroupOp.Movement: return self.src[0].base
-    return self.src[0] if self.op is Ops.VIEW and len(self.src) == 1 else self
+    # base MUST resolve once we hit a VIEW
+    if self.op is Ops.VIEW and len(self.src) == 1:
+      assert self.src[0] is self.src[0].base, f"couldn't resolve base in VIEW {self}"
+      return self.src[0]
+    return self
   def view(self, new_st:ShapeTracker) -> UOp: return UOp(Ops.VIEW, self.dtype, (self.base,), new_st)
 
   def _mop(self, op:Ops, arg):
