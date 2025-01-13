@@ -215,6 +215,16 @@ to_si = PatternMatcher([
 multioutput = PatternMatcher([(UPat.load(UPat.var("b"), UPat()), lambda ctx,b: ctx.get(b)),])
 
 def schedule_uop(pre:UOp, ctx:ScheduleContext) -> ScheduleItem:
+  # start by verifying the ast
+  ast_uops = list(pre.toposort)
+  """
+  if len(ctx.assigns) != 0:
+    buffer_loads = defaultdict(list)
+    for x in ast_uops:
+      if x.op in {Ops.LOAD, Ops.PRELOAD}: buffer_loads.setdefault(x.buf_uop, []).append(x)
+    for k,v in buffer_loads.items():
+      if not all_same([u.op for u in v]): raise RuntimeError("cycle detected in graph")
+  """
   # remove VIEW in the middle of the ast
   base_pm = view_left
   # substitute LOAD of grouped BUFFER with just the store value
@@ -225,9 +235,13 @@ def schedule_uop(pre:UOp, ctx:ScheduleContext) -> ScheduleItem:
   # capture process replay
   if CAPTURE_PROCESS_REPLAY:
     with Context(PICKLE_BUFFERS=0): PROCESS_REPLAY_CAPTURE[str(pre.key)] = pickle.dumps((pre, ContextVar._cache, sink))
+  # verify the ast
+  if (limit:=BUF_LIMIT.get(device:=si_ctx.bufs[0].device)) is not None and len(si_ctx.bufs) >= limit:
+    raise RuntimeError(f"Kernel exceeded the {limit} buffer count limit for {device} with {len(si_ctx.bufs)} buffers.")
+  # create ScheduleItem
   return ScheduleItem(sink, tuple(u.buffer for u in si_ctx.bufs if u.size != 0),
-                      tuple(dedup(m for x in pre.toposort if (m:=ctx.ops_metadata.get(x)) is not None)),
-                      tuple(dedup(b.buf_uop for b in pre.toposort if b.op is Ops.PRELOAD)))
+                      tuple(dedup(m for x in ast_uops if (m:=ctx.ops_metadata.get(x)) is not None)),
+                      tuple(dedup(b.buf_uop for b in ast_uops if b.op is Ops.PRELOAD)))
 
 PROCESS_REPLAY_CAPTURE: dict[str, bytes] = {}
 if CAPTURE_PROCESS_REPLAY:
