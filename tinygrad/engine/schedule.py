@@ -552,6 +552,11 @@ def create_schedule_with_vars(outs:list[UOp], skip_check:bool=not __debug__) -> 
     # can only schedule once
     for buf_uop in store_uops:
       for luop in ctx.tensor_uops[buf_uop]: ctx.becomes_map[luop] = buf_uop.view(tensor_map[luop].st)
+  # this is early become
+  for k,v in tensor_map.items():
+    if k is v: continue
+    if v.base.op is not Ops.BUFFER: continue
+    ctx.becomes_map[k] = v
   # do BFS
   schedule_targets = {out:si for si in prescheduled for out in si.outputs}
   graph: defaultdict[ScheduleItem, list[ScheduleItem]] = defaultdict(list)
