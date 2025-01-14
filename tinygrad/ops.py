@@ -456,8 +456,6 @@ class UOp(MathTrait, metaclass=UOpMetaClass):
   def lbs(self): return [self]
   @property
   def metadata(self): return all_metadata.get(self, None)
-  @property
-  def forced_realize(self): return False
 
   # *** uop movement ops ***
 
