@@ -71,7 +71,6 @@ class ScheduleItem:
   ast: UOp
   bufs: tuple[Buffer, ...]
   metadata: tuple[Metadata, ...]
-  assign_preloads: tuple[UOp, ...]
   @property
   def outputs(self) -> tuple[Buffer, ...]:
     """Read/write or write only buffers in the schedule."""
@@ -215,7 +214,7 @@ add_assign_adjacents = PatternMatcher([(UPat.load(UPat.var("b"), UPat(), name="x
 # LOAD(BUFFER) -> the STORE value if it's we're doing the STORE in the same kernel
 multioutput = PatternMatcher([(UPat.load(UPat.var("b"), UPat()), lambda ctx,b: ctx.get(b)),])
 
-def schedule_uop(pre:UOp, ctx:ScheduleContext) -> ScheduleItem:
+def schedule_uop(pre:UOp, ctx:ScheduleContext) -> tuple[ScheduleItem, list[UOp]]:
   # remove movement ops + substitute LOAD of fused STORE with just the value
   sink = graph_rewrite(graph_rewrite(pre, multioutput+view_left, store_bufs:={x.buf_uop:x.src[2] for x in pre.src}), view_right)
   # remove extra uops from SINK + substitue BUFFER with DEFINE_GLOBAL
@@ -239,7 +238,7 @@ def schedule_uop(pre:UOp, ctx:ScheduleContext) -> ScheduleItem:
             raise RuntimeError("self operand of augmented assign must be contiguous.\nhelp: consider using .contiguous():\n"
                                +colored("   - a += a.T\n", "red")+colored("   + a += a.T.contiguous()", "green"))
   return ScheduleItem(ast, tuple(u.buffer for u in si_ctx.bufs if u.size != 0),
-                      tuple(dedup(m for x in pre.toposort if (m:=ctx.ops_metadata.get(x)) is not None)), tuple(dedup(assign_preloads)))
+                      tuple(dedup(m for x in pre.toposort if (m:=ctx.ops_metadata.get(x)) is not None))), dedup(assign_preloads+si_ctx.bufs)
 
 PROCESS_REPLAY_CAPTURE: dict[str, bytes] = {}
 if CAPTURE_PROCESS_REPLAY:
@@ -537,30 +536,24 @@ def create_schedule_with_vars(outs:list[UOp], skip_check:bool=not __debug__) -> 
   # group realizes into kernels
   store_groups = group_realizes(ctx)
   graph_rewrite(sink, break_sched, ctx)
-  # preschedule realize groups
-  prescheduled: list[ScheduleItem] = []
-  for store_uops in store_groups:
-    if len(stores:=[ctx.realizes[u] for u in store_uops if ctx.realizes[u].op is Ops.STORE]) != 0:
-      prescheduled.append(schedule_uop(UOp.sink(*stores), ctx))
-      # can only schedule once
-      for buf_uop in store_uops:
-        for luop in ctx.tensor_uops[buf_uop]: ctx.becomes_map[luop] = buf_uop.view(unwrap(luop.st))
-  # do BFS
-  schedule_targets = {out:si for si in prescheduled for out in si.outputs}
+  # linearize kernels into a list of schedule items
   graph: defaultdict[ScheduleItem, list[ScheduleItem]] = defaultdict(list)
   in_degree: defaultdict[ScheduleItem, int] = defaultdict(int)
-  for si in prescheduled:
-    # realize outputs before a parent is assigned to
-    parents_assigns = dedup(xsi for x in si.assign_preloads if (xsi:=schedule_targets.get(x.buffer)) and xsi is not si)
-    for assign in parents_assigns:
-      graph[si].append(assign)
-      in_degree[assign] += 1
-    # realize outputs after all parents are realized
-    scheduled_parents = dedup(xsi for x in si.inputs if (xsi:=schedule_targets.get(x)) is not None and xsi not in parents_assigns)
-    for x in scheduled_parents:
+  targets: dict[UOp, ScheduleItem] = {}
+  for store_uops in store_groups:
+    if len(stores:=[ctx.realizes[u] for u in store_uops if ctx.realizes[u].op is Ops.STORE]) == 0: continue
+    si, buffer_keys = schedule_uop(UOp.sink(*stores), ctx)
+    in_degree[si] = 0
+    run_after = dedup(s for x in buffer_keys if (s:=targets.get(x)) is not None)
+    for x in run_after:
       graph[x].append(si)
       in_degree[si] += 1
-  queue = deque(si for si in prescheduled if in_degree[si] == 0)
+    for buf_uop in store_uops:
+      targets[buf_uop] = si
+      # can only schedule once
+      for luop in ctx.tensor_uops[buf_uop]: ctx.becomes_map[luop] = buf_uop.view(unwrap(luop.st))
+  # do BFS
+  queue = deque(si for si,deg in in_degree.items() if in_degree[si] == 0)
   schedule: list[ScheduleItem] = []
   while queue:
     schedule.append(si:=queue.popleft())
@@ -568,6 +561,6 @@ def create_schedule_with_vars(outs:list[UOp], skip_check:bool=not __debug__) -> 
       in_degree[x] -= 1
       if in_degree[x] == 0: queue.append(x)
   # confirm everything was scheduled correctly
-  if len(schedule) != (groups:=len(prescheduled)): raise RuntimeError(f"cycle detected in graph, grouped {groups} but only scheduled {len(schedule)}")
+  if len(schedule) != (groups:=len(store_groups)): raise RuntimeError(f"cycle detected in graph, grouped {groups} but only scheduled {len(schedule)}")
   if DEBUG >= 1 and len(schedule) >= 10: print(f"scheduled {len(schedule)} kernels")
   return schedule, ctx.var_vals, ctx.becomes_map
