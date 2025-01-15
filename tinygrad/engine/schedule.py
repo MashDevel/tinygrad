@@ -99,7 +99,7 @@ class ScheduleContext:
 # this BUFFER preserves a link back to the uop on the tensor after the scheduler rewrites it.
 def add_buffers(buf:UOp, ctx:ScheduleContext, cache:dict[UOp, UOp]) -> UOp:
   if (r:=cache.get(buf)) is not None: return r
-  if buf.op is Ops.SINK: return UOp.sink(*[add_buffers(x, ctx, cache) for x in buf.src])
+  if buf.op is Ops.SINK: return UOp.sink(*[add_buffers(x.base, ctx, cache) for x in buf.src])
   # shapeless op is passthrough
   # realized is passthrough
   # constants are passthrough
@@ -118,7 +118,7 @@ def add_buffers(buf:UOp, ctx:ScheduleContext, cache:dict[UOp, UOp]) -> UOp:
   op = buf.replace(dtype=dtype.base, src=tuple(add_buffers(x, ctx, cache) for x in buf.src))
   # track the underlying tensor uop for this op
   ctx.tensor_uops[buf_uop] = [buf]
-  # (early) bufferize
+  # (less early) bufferize
   cache[buf] = ret = UOp(Ops.VIEW, dtype.base, (buf_uop, op.alu(Ops.CONTIGUOUS) if buf.forced_realize else op), buf.st)
   return ret
 
