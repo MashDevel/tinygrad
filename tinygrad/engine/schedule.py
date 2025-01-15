@@ -94,6 +94,7 @@ class ScheduleContext:
   contiguous: dict[UOp, UOp] = field(default_factory=dict)           # this maps roots to places they are made contiguous
   children: defaultdict[UOp, dict[UOp, None]] = field(default_factory=lambda: defaultdict(dict))
   becomes_map: dict[UOp, UOp] = field(default_factory=dict)
+  forced_realize: set[UOp] = field(default_factory=set)
 
 # wrap tensor uops around a VIEW(BUFFER, <uop>)
 # this BUFFER preserves a link back to the uop on the tensor after the scheduler rewrites it.
@@ -119,7 +120,7 @@ def add_buffers(buf:UOp, ctx:ScheduleContext, tensor_map:dict[UOp, list[UOp]], c
   # track the underlying tensor uops for this uop
   ctx.tensor_uops[buf_uop] = tensor_map[buf]
   # (less early) bufferize
-  cache[buf] = ret = UOp(Ops.VIEW, dtype.base, (buf_uop, op), buf.st)
+  cache[buf] = ret = UOp(Ops.VIEW, dtype.base, (buf_uop, op.alu(Ops.CONTIGUOUS) if buf in ctx.forced_realize else op), buf.st)
   return ret
 
 # **** AST graph rewrite
@@ -376,6 +377,11 @@ def replace_contiguous(ctx:ScheduleContext, alu:UOp):
     if (replace_src:=ctx.contiguous.get(s, None)) is not None: new_src[i] = replace_src
   if tuple(new_src) != alu.src: return alu.replace(src=tuple(new_src))
 
+def fold_contiguous(ctx:ScheduleContext, root:UOp, x:UOp) -> UOp:
+  if x.st.contiguous and x.base.op is not Ops.CONST:
+    ctx.forced_realize.add(x.base)
+    return x
+
 sym = symbolic_simple+PatternMatcher([
   # op with size 0 is zero
   (UPat(set(Ops)-{Ops.SINK, Ops.DEVICE, Ops.BUFFER}, name="root"),
@@ -393,6 +399,7 @@ sym = symbolic_simple+PatternMatcher([
   # no COPY to same device, except clone (arg is True)
   (UPat(Ops.COPY, src=(UPat(), UPat.var("copyin")), name="copy"),
    lambda copyin,copy: copyin if copyin.device == copy.device and copy.arg is not True else None),
+  (UPat(Ops.CONTIGUOUS, name="root", src=(UPat.var("x"),)), fold_contiguous),
   # support for using a contiguous permuted view instead of the parent view if one exists
   (UPat(Ops.CONTIGUOUS, name="contig"), found_contiguous),
   (UPat(GroupOp.ALU, name="alu"), replace_contiguous),
