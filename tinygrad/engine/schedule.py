@@ -379,7 +379,7 @@ def replace_contiguous(ctx:ScheduleContext, alu:UOp):
 
 def remove_contiguous(ctx:ScheduleContext, root:UOp, base:UOp, view:UOp|None=None):
   # sometimes we just have to realize this VIEW to a new BUFFER
-  if view is not None and (not view.st.contiguous or view.st.size != base.size or base.op is Ops.CONST): return None
+  if view is not None and (not unwrap(view.st).contiguous or view.size != base.size or base.op is Ops.CONST): return None
   if base.op is Ops.BUFFER: return view
   # otherwise we realize the base and stack a VIEW on the top
   ctx.forced_realize.add(base)
@@ -530,9 +530,10 @@ def create_schedule_with_vars(outs:list[UOp], skip_check:bool=not __debug__) -> 
     for u in store_uops: tensor_bufs.update((luop, u) for luop in ctx.tensor_uops[u])
 
   # map tensors that got realized to the BUFFER uop
-  for k in tensor_map:
+  for k,v in tensor_map.items():
     if (buffer:=tensor_bufs.get(k)) is not None:
       ctx.becomes_map[k] = buffer.view(unwrap(k.st))
+    elif k is not v and v.is_realized: ctx.becomes_map[k] = v
 
   # add kernel children
   schedule_targets = {out:si for si in prescheduled for out in si.outputs}
