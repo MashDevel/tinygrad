@@ -376,7 +376,7 @@ def replace_contiguous(ctx:ScheduleContext, alu:UOp):
     if (replace_src:=ctx.contiguous.get(s, None)) is not None: new_src[i] = replace_src
   if tuple(new_src) != alu.src: return alu.replace(src=tuple(new_src))
 
-ops_folding = symbolic_simple+PatternMatcher([
+sym = symbolic_simple+PatternMatcher([
   # op with size 0 is zero
   (UPat(set(Ops)-{Ops.SINK, Ops.DEVICE, Ops.BUFFER}, name="root"),
    lambda root: root.const_like(0) if root.size == 0 and not (root.base.op is Ops.CONST and root.base.const_arg == 0) \
@@ -499,7 +499,7 @@ def create_schedule_with_vars(outs:list[UOp], skip_check:bool=not __debug__) -> 
   sink = UOp.sink(*outs)
   if not skip_check: type_verify(list(sink.toposort), tensor_uop_spec)
   # start by doing graph rewrite on the tensors
-  tensor_map = graph_rewrite_map(sink, remove_movement_ops+ops_folding, ctx:=ScheduleContext())
+  tensor_map = graph_rewrite_map(sink, remove_movement_ops+sym, ctx:=ScheduleContext())
   # NOTE: one simplified UOp can map to many tensors
   rev_tensor_map: dict[UOp, list[UOp]] = {}
   for k,v in tensor_map.items(): rev_tensor_map.setdefault(v, []).append(k)
