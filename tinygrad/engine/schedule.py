@@ -97,16 +97,16 @@ class ScheduleContext:
 
 # wrap tensor uops around a VIEW(BUFFER, <uop>)
 # this BUFFER preserves a link back to the uop on the tensor after the scheduler rewrites it.
-def add_buffers(buf:UOp, ctx:ScheduleContext, cache:dict[UOp, UOp]) -> UOp:
+def add_buffers(buf:UOp, ctx:ScheduleContext, tensor_map:dict[UOp, list[UOp]], cache:dict[UOp, UOp]) -> UOp:
   if (r:=cache.get(buf)) is not None: return r
-  if buf.op is Ops.SINK: return buf.replace(src=tuple([add_buffers(x.base, ctx, cache) for x in buf.src]))
+  if buf.op is Ops.SINK: return buf.replace(src=tuple([add_buffers(x.base, ctx, tensor_map, cache) for x in buf.src]))
   # shapeless op is passthrough
   # realized is passthrough
   # constants are passthrough
   if buf.st is None or buf.base.is_realized or buf.base.op in {Ops.CONST, Ops.BIND}: return buf
   # view is passthrough
   if buf is not buf.base:
-    cache[buf] = ret = add_buffers(buf.base, ctx, cache).view(buf.st)
+    cache[buf] = ret = add_buffers(buf.base, ctx, tensor_map, cache).view(buf.st)
     return ret
   # make things that can't be images not images
   dtype = buf.dtype
@@ -115,9 +115,9 @@ def add_buffers(buf:UOp, ctx:ScheduleContext, cache:dict[UOp, UOp]) -> UOp:
     dtype = buf.dtype.base
   # ASSIGN already has a target buffer, otherwise we create a new one
   buf_uop = buf.buf_uop if buf.op is Ops.ASSIGN else UOp.new_buffer(buf.device, buf.size, dtype)
-  op = buf.replace(dtype=dtype.base, src=tuple(add_buffers(x, ctx, cache) for x in buf.src))
-  # track the underlying tensor uop for this op
-  ctx.tensor_uops[buf_uop] = [buf]
+  op = buf.replace(dtype=dtype.base, src=tuple(add_buffers(x, ctx, tensor_map, cache) for x in buf.src))
+  # track the underlying tensor uops for this uop
+  ctx.tensor_uops[buf_uop] = tensor_map[buf]
   # (less early) bufferize
   cache[buf] = ret = UOp(Ops.VIEW, dtype.base, (buf_uop, op), buf.st)
   return ret
@@ -500,8 +500,11 @@ def create_schedule_with_vars(outs:list[UOp], skip_check:bool=not __debug__) -> 
   if not skip_check: type_verify(list(sink.toposort), tensor_uop_spec)
   # start by doing graph rewrite on the tensors
   tensor_map = graph_rewrite_map(sink, remove_movement_ops+ops_folding, ctx:=ScheduleContext())
+  # NOTE: one simplified UOp can map to many tensors
+  rev_tensor_map: dict[UOp, list[UOp]] = {}
+  for k,v in tensor_map.items(): rev_tensor_map.setdefault(v, []).append(k)
   # give the remaining uops buffers
-  sink = add_buffers(tensor_map[sink], ctx, cache={})
+  sink = add_buffers(tensor_map[sink], ctx, rev_tensor_map, cache={})
   # add realizes and group them into kernels
   sink = graph_rewrite(sink, do_realize+create_ctx, ctx)
   store_groups = group_realizes(ctx)
@@ -510,13 +513,14 @@ def create_schedule_with_vars(outs:list[UOp], skip_check:bool=not __debug__) -> 
   prescheduled: list[ScheduleItem] = []
   tensor_bufs: dict[UOp, UOp] = {}
   for store_uops in store_groups:
-    if len(stores:=[ctx.realizes[u] for u in store_uops if ctx.realizes[u].op is Ops.STORE]) == 0: continue
+    stores = [ctx.realizes[u] for u in store_uops]
+    assert all(x.op is Ops.STORE for x in stores), f"expected all realizes to have a STORE {stores}"
     prescheduled.append(schedule_uop(UOp.sink(*stores), ctx))
     for u in store_uops: tensor_bufs.update((luop, u) for luop in ctx.tensor_uops[u])
 
   # map tensors that got realized to the BUFFER uop
-  for k,v in tensor_map.items():
-    if (buffer:=tensor_bufs.get(v)) is not None:
+  for k in tensor_map:
+    if (buffer:=tensor_bufs.get(k)) is not None:
       ctx.becomes_map[k] = buffer.view(unwrap(k.st))
 
   # add kernel children
