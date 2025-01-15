@@ -2,7 +2,7 @@ import sys, atexit, functools, pickle
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from tinygrad.ops import GroupOp, UOp, Ops, PatternMatcher, UPat, Variable, can_pad, graph_rewrite, resolve, track_rewrites, view_left, merge_views
-from tinygrad.ops import identity_element, buffers, symbolic_simple, type_verify
+from tinygrad.ops import identity_element, buffers, symbolic_simple, type_verify, graph_rewrite_map
 from tinygrad.helpers import Context, Metadata, all_int, all_same, colored, diskcache_put, merge_dicts, prod, dedup, getenv, unwrap
 from tinygrad.helpers import FUSE_CONV_BW, FUSE_ARANGE, DEBUG, CAPTURE_PROCESS_REPLAY, ContextVar
 from tinygrad.dtype import DType, ImageDType, dtypes
@@ -44,9 +44,7 @@ tensor_uop_spec = PatternMatcher([
   (UPat(Ops.COPY, name="copy", src=(UPat(Ops.DEVICE), UPat.var("x"))), lambda copy,x: isinstance(copy.arg, bool) and copy.dtype == x.dtype),
 
   # VIEW(BUFFER) applies a ShapeTracker on top of the underlying device buffer
-  # NOTE: VIEW size exactly matches the underlying BUFFER, tensor doesn't apply movement ops to the VIEW
-  (UPat(Ops.VIEW, name="view", src=(UPat(Ops.BUFFER, name="buf"),)),
-   lambda view,buf: view.dtype == buf.dtype and view.size == buf.size and view.st.contiguous),
+  (UPat(Ops.VIEW, name="view", src=(UPat(Ops.BUFFER, name="buf"),)), lambda view,buf: view.dtype == buf.dtype),
 
   # ASSIGN changes the value of a realized buffer
   (UPat(Ops.ASSIGN, name="assign", src=(UPat.var("target"), UPat.var("new_val"))),
@@ -526,9 +524,12 @@ remove_movement_ops = PatternMatcher([
 
 @track_rewrites(named=True)
 def create_schedule_with_vars(outs:list[UOp], skip_check:bool=not __debug__) -> tuple[list[ScheduleItem], dict[Variable, int], dict[UOp, UOp]]:
-  if not skip_check: type_verify(list(UOp.sink(*outs).toposort), tensor_uop_spec)
-  # to_uop is removing (many) of the movement ops
-  sink = add_buffers(UOp.sink(*outs), ctx:=ScheduleContext(), cache={})
+  sink = UOp.sink(*outs)
+  if not skip_check: type_verify(list(sink.toposort), tensor_uop_spec)
+  # start by doing graph rewrite on the tensors
+  tensor_map = graph_rewrite_map(sink, remove_movement_ops)
+  # give whatever tensors that are left buffers
+  sink = add_buffers(tensor_map[sink], ctx:=ScheduleContext(), cache={})
   # const folding and fusion
   sink = graph_rewrite(sink, remove_movement_ops+ops_folding+do_realize, ctx)
   sink = graph_rewrite(sink, merge_bufs, ctx)
@@ -542,9 +543,15 @@ def create_schedule_with_vars(outs:list[UOp], skip_check:bool=not __debug__) -> 
   for store_uops in store_groups:
     if len(stores:=[ctx.realizes[u] for u in store_uops if ctx.realizes[u].op is Ops.STORE]) == 0: continue
     prescheduled.append(schedule_uop(UOp.sink(*stores), ctx))
-    # can only schedule once
-    for buf_uop in store_uops:
-      for luop in ctx.tensor_uops[buf_uop]: ctx.becomes_map[luop] = buf_uop.view(unwrap(luop.st))
+
+  # map tensors that got realized to the BUFFER uop
+  for k, v in tensor_map.items():
+    if k is not v and v.base.op is Ops.BUFFER:
+      ctx.becomes_map[k] = v.view(unwrap(k.st))
+    generated_bufs = [buf for buf,lst in ctx.tensor_uops.items() if v.base in lst]
+    if len(generated_bufs) == 0: continue
+    assert len(generated_bufs) == 1, f"a tensor can only map to exactly 0 or 1 BUFFER {generated_bufs}"
+    ctx.becomes_map[k] = generated_bufs[0].view(unwrap(k.st))
 
   # add kernel children
   schedule_targets = {out:si for si in prescheduled for out in si.outputs}
