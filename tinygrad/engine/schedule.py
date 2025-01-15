@@ -377,10 +377,13 @@ def replace_contiguous(ctx:ScheduleContext, alu:UOp):
     if (replace_src:=ctx.contiguous.get(s, None)) is not None: new_src[i] = replace_src
   if tuple(new_src) != alu.src: return alu.replace(src=tuple(new_src))
 
-def fold_contiguous(ctx:ScheduleContext, root:UOp, x:UOp) -> UOp:
-  if x.st.contiguous and x.base.op is not Ops.CONST:
-    ctx.forced_realize.add(x.base)
-    return x
+def remove_contiguous(ctx:ScheduleContext, root:UOp, base:UOp, view:UOp|None=None):
+  # sometimes we just have to realize this VIEW to a new BUFFER
+  if view is not None and (not view.st.contiguous or view.st.size != base.size or base.op is Ops.CONST): return None
+  if base.op is Ops.BUFFER: return view
+  # otherwise we realize the base and stack a VIEW on the top
+  ctx.forced_realize.add(base)
+  return root.src[0]
 
 sym = symbolic_simple+PatternMatcher([
   # op with size 0 is zero
@@ -399,7 +402,8 @@ sym = symbolic_simple+PatternMatcher([
   # no COPY to same device, except clone (arg is True)
   (UPat(Ops.COPY, src=(UPat(), UPat.var("copyin")), name="copy"),
    lambda copyin,copy: copyin if copyin.device == copy.device and copy.arg is not True else None),
-  (UPat(Ops.CONTIGUOUS, name="root", src=(UPat.var("x"),)), fold_contiguous),
+  (UPat(Ops.CONTIGUOUS, name="root", src=(UPat(Ops.VIEW, name="view", src=(UPat.var("base"),)),)), remove_contiguous),
+  (UPat(Ops.CONTIGUOUS, name="root", src=(UPat(set(Ops)-{Ops.VIEW, Ops.CONST}, name="base"),)), remove_contiguous),
   # support for using a contiguous permuted view instead of the parent view if one exists
   (UPat(Ops.CONTIGUOUS, name="contig"), found_contiguous),
   (UPat(GroupOp.ALU, name="alu"), replace_contiguous),
