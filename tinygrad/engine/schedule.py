@@ -540,18 +540,16 @@ def create_schedule_with_vars(outs:list[UOp], skip_check:bool=not __debug__) -> 
   graph_rewrite(sink, break_sched, ctx)
   # preschedule realize groups
   prescheduled: list[ScheduleItem] = []
+  tensor_bufs: dict[UOp, UOp] = {}
   for store_uops in store_groups:
     if len(stores:=[ctx.realizes[u] for u in store_uops if ctx.realizes[u].op is Ops.STORE]) == 0: continue
     prescheduled.append(schedule_uop(UOp.sink(*stores), ctx))
+    for u in store_uops: tensor_bufs.update((luop, u) for luop in ctx.tensor_uops[u])
 
   # map tensors that got realized to the BUFFER uop
-  for k, v in tensor_map.items():
-    if k is not v and v.base.op is Ops.BUFFER:
-      ctx.becomes_map[k] = v.view(unwrap(k.st))
-    generated_bufs = [buf for buf,lst in ctx.tensor_uops.items() if v.base in lst]
-    if len(generated_bufs) == 0: continue
-    assert len(generated_bufs) == 1, f"a tensor can only map to exactly 0 or 1 BUFFER {generated_bufs}"
-    ctx.becomes_map[k] = generated_bufs[0].view(unwrap(k.st))
+  for k,v in tensor_map.items():
+    if (buffer:=tensor_bufs.get(v.base)) is not None:
+      ctx.becomes_map[k] = buffer.view(unwrap(k.st))
 
   # add kernel children
   schedule_targets = {out:si for si in prescheduled for out in si.outputs}
