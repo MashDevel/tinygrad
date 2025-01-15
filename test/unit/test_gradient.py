@@ -4,7 +4,7 @@ import jax
 import jax.numpy as jnp
 from tinygrad import Tensor
 from tinygrad.dtype import dtypes
-from tinygrad.ops import UOp, Ops
+from tinygrad.ops import UOp, Ops, UPat
 from tinygrad.gradient import compute_gradient
 
 class TestGradient(unittest.TestCase):
@@ -104,11 +104,11 @@ class TestRealizeMeansRealize(unittest.TestCase):
     x = Tensor.randn(2, 3, 64, 64, requires_grad=True).realize()
     self.assertEqual(x.lazydata.op, Ops.VIEW)
 
-  @unittest.expectedFailure
   def test_uniform_realizes(self):
     x = Tensor.uniform(16, 3, 3, 3, requires_grad=True).realize()
     print(x.lazydata)
     self.assertEqual(x.lazydata.op, Ops.VIEW)
+    assert UPat(Ops.VIEW, src=(UPat(Ops.BUFFER),)).match(x.lazydata, {})
 
   # NOTE: even though it doesn't realize, this seems fine
   def test_uniform_gradient(self):
