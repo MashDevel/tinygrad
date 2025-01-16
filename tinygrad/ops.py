@@ -226,8 +226,12 @@ class UOpMetaClass(type):
     for s in src: s.children.add(ref)
     # NOTE: this will soon be set by Tensor once we remove function.py
     if (metadata:=_METADATA.get()) is not None: all_metadata[created] = metadata
-    if op is Ops.CONST and (st:=created.st) is not None:
-      assert len(st.st.views) == 1 and all(s == 0 for s in st.st.views[0].strides) and st.st.views[0].mask is None
+    if op is Ops.CONST and len(src) != 0:
+      st = src[0].st
+      vcnt = len(st.views) == 1
+      vstride = all(s == 0 for s in st.views[0].strides)
+      vmask = st.views[0].mask is None
+      assert vcnt and vstride and vmask, f"{created} {vcnt=} {vstride=} {vmask=} {st}"
     # NOTE: this value is set by pickle when pickling a realized tensor
     if _buffer is not None:
       assert op is Ops.BUFFER, f"trying to set Buffer {_buffer} for {op}"
