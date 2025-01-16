@@ -153,7 +153,7 @@ def merge_double_reduce(root:UOp, first_reduce:UOp) -> UOp:
   assert not any(x.op is Ops.REDUCE_AXIS for x in first_reduce.src[0].toposort), "can't merge more than two reduceops at a time"
   return first_reduce.replace(arg=(first_reduce.arg[0], root.axis_arg+first_reduce.axis_arg))
 
-# push VIEW to stores
+# push VIEW to children
 view_right = merge_views+PatternMatcher([
   # STORE(.., ASSIGN(VIEW(BUFFER), new_val)) -> STORE(.., new_val).view()
   (UPat(Ops.STORE, src=(UPat.var("b"), UPat.var("st"), UPat.assign(UPat.var("target"), UPat.var("val")))),
