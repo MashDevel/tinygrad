@@ -157,7 +157,7 @@ def merge_double_reduce(root:UOp, first_reduce:UOp) -> UOp:
 view_right = merge_views+PatternMatcher([
   # STORE(.., ASSIGN(VIEW(BUFFER), new_val)) -> STORE(.., new_val).view()
   (UPat(Ops.STORE, src=(UPat.var("b"), UPat.var("st"), UPat.assign(UPat.var("target"), UPat.var("val")))),
-   lambda b,target,st,val: apply_swizzle(UOp.store(b, st, val).view(target.st))),
+   lambda b,target,st,val: apply_swizzle(UOp.store(b, st.view(target.st), val))),
   # REDUCE(src.view(contiguous=False)) -> REDUCE(src.view(contiguous=True)).view()
   (UPat(Ops.REDUCE_AXIS, src=(UPat.var("src"),), name="r").view(name="v"), lambda v,r,src: None if v.st.contiguous else swizzle_r(r, src, v.st)),
   # REDUCE(src.view()) -> REDUCE(src).view()
