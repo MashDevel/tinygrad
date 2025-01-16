@@ -1288,6 +1288,6 @@ merge_views = PatternMatcher([
 
 # push VIEW to parents
 view_left = merge_views+PatternMatcher([
-  (UPat(GroupOp.ALU|GroupOp.Buffer|{Ops.CAST, Ops.BITCAST, Ops.ASSIGN}, name="e").view(name="v"),
-   lambda e,v: e.replace(src=tuple(s if s.st is None else s.view(v.st) if s is s.base else s.base.view(s.st+v.st) for s in e.src))),
+  (UPat(Ops.VIEW, name="view", src=(UPat(GroupOp.Buffer|GroupOp.ALU|{Ops.CAST, Ops.BITCAST, Ops.ASSIGN}, name="base"),)),
+   lambda view,base: base.replace(src=tuple(x if x.st is None else x.view(view.st) for x in base.src))),
 ])
