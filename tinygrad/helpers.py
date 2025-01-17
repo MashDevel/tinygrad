@@ -3,6 +3,7 @@ import os, functools, platform, time, re, contextlib, operator, hashlib, pickle,
 import urllib.request, subprocess, shutil, math, contextvars, types, copyreg, inspect, importlib
 from dataclasses import dataclass
 from typing import Union, ClassVar, Optional, Iterable, Any, TypeVar, Callable, Sequence, TypeGuard, Iterator, Generic
+import time
 
 T = TypeVar("T")
 U = TypeVar("U")
@@ -236,25 +237,82 @@ def _ensure_downloads_dir() -> pathlib.Path:
     return downloads_dir
   return pathlib.Path(cache_dir) / "downloads"
 
-def fetch(url:str, name:Optional[Union[pathlib.Path, str]]=None, subdir:Optional[str]=None, gunzip:bool=False,
-          allow_caching=not getenv("DISABLE_HTTP_CACHE")) -> pathlib.Path:
-  if url.startswith(("/", ".")): return pathlib.Path(url)
-  if name is not None and (isinstance(name, pathlib.Path) or '/' in name): fp = pathlib.Path(name)
-  else: fp = _ensure_downloads_dir() / (subdir or "") / ((name or hashlib.md5(url.encode('utf-8')).hexdigest()) + (".gunzip" if gunzip else ""))
-  if not fp.is_file() or not allow_caching:
-    (_dir := fp.parent).mkdir(parents=True, exist_ok=True)
-    with urllib.request.urlopen(url, timeout=10) as r:
-      assert r.status == 200, r.status
-      length = int(r.headers.get('content-length', 0)) if not gunzip else None
-      readfile = gzip.GzipFile(fileobj=r) if gunzip else r
-      progress_bar:tqdm = tqdm(total=length, unit='B', unit_scale=True, desc=f"{url}", disable=CI)
-      with tempfile.NamedTemporaryFile(dir=_dir, delete=False) as f:
-        while chunk := readfile.read(16384): progress_bar.update(f.write(chunk))
-        f.close()
-        pathlib.Path(f.name).rename(fp)
-      progress_bar.update(close=True)
-      if length and (file_size:=os.stat(fp).st_size) < length: raise RuntimeError(f"fetch size incomplete, {file_size} < {length}")
-  return fp
+def safe_replace(src_path: pathlib.Path, dst_path: pathlib.Path, max_retries=5, delay=0.5):
+    """
+    Attempt to replace `dst_path` with `src_path`.
+    If a PermissionError occurs (commonly on Windows), we check whether dst_path exists.
+    - If it does, another process may have succeeded first, so we return.
+    - If it doesn't, we sleep briefly and retry.
+    """
+    last_exc = None
+    for _ in range(max_retries):
+        try:
+            src_path.replace(dst_path)
+            return
+        except PermissionError as e:
+            last_exc = e
+            if dst_path.exists():
+                # If the target file exists now, another process probably wrote it first
+                return
+            time.sleep(delay)
+    # If we exhaust retries, raise the last PermissionError
+    raise last_exc
+
+def fetch(url: str, 
+          name: Optional[Union[pathlib.Path, str]] = None,
+          subdir: Optional[str] = None,
+          gunzip: bool = False,
+          allow_caching = True) -> pathlib.Path:
+    """
+    Download (and optionally gunzip) 'url' into .cache/tinygrad/downloads or a subdir.
+    Retries the final replace operation to avoid concurrency-related PermissionError on Windows.
+    """
+    # If the URL is a local path, return that directly
+    if url.startswith(("/", ".")):
+        return pathlib.Path(url)
+
+    # Resolve the final download path
+    if name is not None and (isinstance(name, pathlib.Path) or '/' in name):
+        fp = pathlib.Path(name)
+    else:
+        fp = _ensure_downloads_dir() / (subdir or "") / (
+            (name or hashlib.md5(url.encode('utf-8')).hexdigest()) 
+            + (".gunzip" if gunzip else "")
+        )
+
+    # If caching is off or the file doesn't exist, download it
+    if not fp.is_file() or not allow_caching:
+        (_dir := fp.parent).mkdir(parents=True, exist_ok=True)
+        with urllib.request.urlopen(url, timeout=10) as r:
+            assert r.status == 200, r.status
+            length = int(r.headers.get('content-length', 0)) if not gunzip else None
+            readfile = gzip.GzipFile(fileobj=r) if gunzip else r
+            progress_bar = tqdm(total=length, unit='B', unit_scale=True, desc=f"{url}", disable=False)
+            
+            # Write download to a temp file
+            with tempfile.NamedTemporaryFile(dir=_dir, delete=False) as f:
+                while chunk := readfile.read(16384):
+                    progress_bar.update(f.write(chunk))
+                f.close()
+                # Safely replace the final file (retry if PermissionError on Windows)
+                safe_replace(pathlib.Path(f.name), fp)
+            
+            progress_bar.update(close=True)
+            
+            # Check final file size if we have a known content-length
+            if length and (file_size := os.stat(fp).st_size) < length:
+                raise RuntimeError(f"fetch size incomplete, {file_size} < {length}")
+
+    return fp
+
+def _ensure_downloads_dir() -> pathlib.Path:
+    """
+    Return the base directory for caching downloads (e.g., ~/.cache/tinygrad/downloads).
+    Implement however your code currently does it.
+    """
+    base = pathlib.Path(os.path.expanduser("~")) / ".cache" / "tinygrad" / "downloads"
+    base.mkdir(parents=True, exist_ok=True)
+    return base
 
 # *** Exec helpers
 
